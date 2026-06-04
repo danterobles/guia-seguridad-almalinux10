@@ -838,15 +838,4 @@ mysqldump --single-transaction --routines miapp | gzip > /backups/miapp-$(date +
 
 ---
 
-### Resumen de cambios respecto a la guía vieja (CentOS 7)
 
-- `yum` → `dnf`; `net-tools`/`netstat` → `iproute2`/`ss`.
-- `iptables-services` puro → `firewalld` (dinámico e integrado con SELinux).
-- SELinux: en lugar de **apagarlo**, se le dan contextos y booleanos específicos.
-- PHP por **módulos de Remi** (8.5) en vez de repos `php7Xw` sueltos.
-- MySQL con **privilegios mínimos** y bind a localhost, en vez de `GRANT ALL ... *.*`.
-- Composer **2.x** en vez de 1.9.
-- Capa nueva de **hardening**: SSH por llaves, cabeceras HTTP, ocultamiento de versiones, Fail2Ban con filtro propio, bloqueo de User-Agents, security.txt.
-- Soporte añadido para **Node.js 24 LTS** vía servicio systemd aislado + reverse proxy de Apache con TLS.
-
-*Documento generado a partir del análisis de la sesión de configuración de hardening para AlmaLinux 10. Versiones verificadas a mayo de 2026 (PHP 8.5 GA, Node.js 24 LTS).*
