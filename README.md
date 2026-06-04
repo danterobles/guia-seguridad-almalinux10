@@ -2,7 +2,7 @@
 
 **Objetivo:** Levantar desde cero un servidor de producción **muy seguro** sobre **AlmaLinux 10**, capaz de hospedar tanto aplicaciones **Laravel (PHP 8.5 / Filament)** como aplicaciones **Node.js (LTS 24)**, detrás de Apache, con SSL de Let's Encrypt, SELinux en modo *Enforcing* y defensa activa con Fail2Ban.
 
-**Pila tecnológica:** AlmaLinux 10 · Apache 2.4 · PHP 8.5 (php-fpm vía Remi) · MySQL 8 · Node.js 24 LTS · Let's Encrypt · firewalld · SELinux · Fail2Ban
+**Pila tecnológica:** AlmaLinux 10 · Apache 2.4 (MPM event + HTTP/2) · PHP 8.5 (php-fpm vía Remi) · MySQL 8.4 · Valkey 8 · Node.js 24 LTS · Let's Encrypt · firewalld · SELinux · Fail2Ban · Cloudflare Turnstile
 
 > **Cómo usar este documento.** Está pensado como *runbook* (paso a paso reproducible) y como referencia de auditoría. Sustituye los marcadores `tu-dominio.com`, `miapp`, `tu.ip.publica.aqui` y los nombres de usuario/BD por los reales. Ejecuta los comandos como `root` o anteponiendo `sudo`.
 
@@ -25,13 +25,16 @@
 13. [Let's Encrypt (SSL) y renovación automática](#13-lets-encrypt-ssl-y-renovación-automática)
 14. [Cabeceras de seguridad HTTP](#14-cabeceras-de-seguridad-http)
 15. [Ocultar versiones (information leakage)](#15-ocultar-versiones-information-leakage)
-16. [Bloqueo de bots por User-Agent](#16-bloqueo-de-bots-por-user-agent)
+16. [Bloqueo de bots por User-Agent y rutas de exploit](#16-bloqueo-de-bots-por-user-agent-y-rutas-de-exploit)
 17. [Fail2Ban: defensa activa](#17-fail2ban-defensa-activa)
 18. [security.txt y robots.txt](#18-securitytxt-y-robotstxt)
 19. [Flujo de despliegue con Git](#19-flujo-de-despliegue-con-git)
 20. [Actualizaciones automáticas y mantenimiento](#20-actualizaciones-automáticas-y-mantenimiento)
-21. [Checklist final de verificación](#21-checklist-final-de-verificación)
-22. [Apéndice: DNSSEC, GeoIP y PGP](#22-apéndice-dnssec-geoip-y-pgp)
+21. [Valkey (caché, sesiones y colas)](#21-valkey-caché-sesiones-y-colas)
+22. [Protección de formularios públicos (Turnstile + rate limiting)](#22-protección-de-formularios-públicos-turnstile--rate-limiting)
+23. [Optimización de rendimiento](#23-optimización-de-rendimiento)
+24. [Checklist final de verificación](#24-checklist-final-de-verificación)
+25. [Apéndice: DNSSEC, GeoIP y PGP](#25-apéndice-dnssec-geoip-y-pgp)
 
 ---
 
@@ -592,35 +595,47 @@ Tras esto, la cabecera `Server` dirá solo `Apache` (sin versión) y desaparecer
 
 ---
 
-## 16. Bloqueo de bots por User-Agent
+## 16. Bloqueo de bots por User-Agent y rutas de exploit
 
-Los logs reales muestran bots como `l9explore` y `l9tcpid` rastreando `.env`, `.git/config` y credenciales de AWS. Bloquéalos en Apache (dentro del `<Directory>` del sitio, para cortar antes de que Laravel procese nada):
+Los logs reales muestran dos tipos de ruido automatizado: escáneres que se identifican con User-Agents conocidos (`l9scan`, `zgrab`, `Nikto`, `CensysInspect`) y bots que piden rutas que no existen en la app (`/.env`, `/.git/config`, `/vendor/phpunit/.../eval-stdin.php`, `/wp-config.php`). Conviene cortar ambos **a nivel del VirtualHost**, antes de que la petición llegue a PHP.
+
+> **Lección aprendida — no ancles el User-Agent con `^`.** Una versión anterior usaba `RewriteCond %{HTTP_USER_AGENT} ^Nmap`, que solo coincide si el UA *empieza* exactamente con esa cadena. Bots como `l9scan` se anuncian como `Mozilla/5.0 (l9scan/2.0...)`, así que el ancla los dejaba pasar. La regla correcta busca la cadena en **cualquier parte** del User-Agent.
+
+Coloca el bloqueo directamente bajo el `<VirtualHost *:443>`, no dentro del `<Directory>`. El contexto de servidor se evalúa antes y de forma independiente del `.htaccess` de Laravel, así que el bloqueo aplica a toda petición sin depender de qué procese Laravel después. Requiere `RewriteEngine On` explícito en este contexto:
 
 ```apache
-<Directory /var/www/miapp/public>
-    RewriteEngine On
+RewriteEngine On
 
-    RewriteCond %{HTTP_USER_AGENT} ^l9explore   [NC,OR]
-    RewriteCond %{HTTP_USER_AGENT} ^l9tcpid      [NC,OR]
-    RewriteCond %{HTTP_USER_AGENT} ^Nmap         [NC,OR]
-    RewriteCond %{HTTP_USER_AGENT} ^Masscan      [NC,OR]
-    RewriteCond %{HTTP_USER_AGENT} ^zgrab        [NC,OR]
-    RewriteCond %{HTTP_USER_AGENT} ^Nikto        [NC,OR]
-    RewriteCond %{HTTP_USER_AGENT} ^User-Agent   [NC,OR]
-    RewriteCond %{HTTP_USER_AGENT} (libwww|Wget|LWP|Python|urllib|scan) [NC]
-    RewriteRule ^ - [F,L]
+# 1) Bloqueo por User-Agent — SIN ancla ^, para cazarlos en cualquier
+#    parte de la cadena (ej. "Mozilla/5.0 (l9scan/...)" ya no se cuela)
+RewriteCond %{HTTP_USER_AGENT} (l9explore|l9scan|l9tcpid|Nmap|Masscan|zgrab|Nikto|CensysInspect|leakix|libredtail|Gh0st) [NC]
+RewriteRule ^ - [F,L]
 
-    Options -Indexes +FollowSymLinks
-    AllowOverride All
-    Require all granted
-</Directory>
+# 2) User-Agent vacío en peticiones que no sean a la raíz (bots crudos)
+RewriteCond %{HTTP_USER_AGENT} ^-?$
+RewriteCond %{REQUEST_URI} !^/$
+RewriteRule ^ - [F,L]
+
+# 3) Bloqueo de archivos ocultos (.env, .git, etc.)
+#    EXCEPTO /.well-known (necesario para la renovación de Let's Encrypt)
+RewriteRule "(^|/)\.(?!well-known)" - [F,L]
+
+# 4) Rutas de exploit conocidas (PHPUnit eval-stdin, vendor, basura .php)
+RewriteCond %{REQUEST_URI} (eval-stdin\.php|/vendor/|/phpunit|/wp-|xmlrpc\.php|/phpinfo|/\.aws|/\.ssh) [NC]
+RewriteRule ^ - [F,L]
 ```
 
-A partir de aquí, esos bots reciben **403 Forbidden** en lugar de un 404. Eso es bueno: en la sección siguiente haremos que Fail2Ban banee a cualquiera que acumule 403.
+> **El `/.well-known` es crítico.** Si bloquearas todos los dotfiles sin excepción, romperías el reto ACME de Certbot (`/.well-known/acme-challenge/`) y tu certificado dejaría de renovarse. El `(?!well-known)` lo protege.
+
+> **No bloquees `curl` por User-Agent.** Aunque aparezca en escaneos, es la herramienta con la que tú mismo haces pruebas y health checks. Ese comportamiento es mejor dejárselo a Fail2Ban (banea por conducta, no por nombre), ver sección 17.
+
+A partir de aquí, esos bots reciben **403 Forbidden** en lugar de un 404. Eso es bueno: Fail2Ban (siguiente sección) banea a cualquiera que acumule 403.
 
 ```bash
 apachectl configtest && systemctl restart httpd
 ```
+
+**Resultado medible.** En un caso real de este servidor, tras aplicar el bloqueo el log pasó a registrar cientos de `403` diarios contra escaneo de `/.env`, `/.git/config`, `/wp-config.php` y `/.aws/credentials` que antes pasaban como `404` inofensivos pero llegaban hasta PHP. Una sola IP de escaneo agresivo (`45.148.10.95`) acumuló 220 bloqueos en un día sin tocar la aplicación.
 
 ---
 
@@ -670,12 +685,14 @@ maxretry = 2
 
 ```ini
 [Definition]
-# Captura 404 (búsqueda de archivos sensibles) y 403 (bloqueos por User-Agent)
+# Captura 404 (búsqueda de archivos sensibles) y 403 (bloqueos por User-Agent / dotfiles)
 failregex = ^<HOST> -.*"GET .*\.(env|git|aws|yml|yaml|json).* HTTP/.*" (404|403)
             ^<HOST> -.*"GET .*(\.git|config|credentials).* HTTP/.*" (404|403)
             ^<HOST> -.*"(GET|POST) .* HTTP/.*" 403
 ignoreregex =
 ```
+
+> **Sobre el abuso de formularios públicos (registro, contacto).** Las IPs que martillan `POST /registro` rotan direcciones y usan User-Agents de navegador real, así que un filtro por 403 no las atrapa: a nivel HTTP son indistinguibles de un humano. La defensa correcta para eso **no es Fail2Ban** sino Cloudflare Turnstile + rate limiting + verificación de email (ver sección 22). Si aun así quieres que Fail2Ban reaccione a los más insistentes, puedes añadir un filtro que cuente los `429` (rate-limit de Laravel) por IP, pero es defensa secundaria, no la principal.
 
 **Cárcel** que usa ese filtro sobre tu log de acceso (ajusta la ruta a tu `CustomLog`). Añádela al final de `jail.local`:
 
@@ -807,7 +824,377 @@ mysqldump --single-transaction --routines miapp | gzip > /backups/miapp-$(date +
 
 ---
 
-## 21. Checklist final de verificación
+## 21. Valkey (caché, sesiones y colas)
+
+Para que Laravel/Filament rindan en producción, mueve la caché, las sesiones y las colas de la base de datos a un almacén en memoria. **AlmaLinux 10 ya no incluye Redis** (Redis Labs cambió a licencias no-FOSS en la versión 7.4 y la distro lo retiró de sus repos); el reemplazo oficial en el AppStream es **Valkey**, un fork con licencia FOSS. Es *drop-in*: phpredis y el driver `redis` de Laravel hablan con Valkey sin cambiar nada en el código de la aplicación.
+
+> **Por qué Valkey y no Redis vía Remi.** Redis volvió a una licencia open source (AGPLv3) en la 8.0 y hay RPMs en `remi-modular`, pero eso ataría las actualizaciones de seguridad de un *datastore* (que guardará sesiones) a un repo de terceros. Valkey desde el AppStream oficial recibe parches por el ciclo normal de la distro, con menos superficie de mantenimiento. Salvo que necesites una función muy nueva de Redis 8.x, Valkey es la opción recomendada.
+
+### 21.1 Instalación
+
+```bash
+dnf install -y valkey
+valkey-server --version
+```
+
+### 21.2 Configuración segura
+
+El modelo de amenaza clásico de Redis/Valkey es "instancia expuesta a internet sin contraseña". Como aquí Valkey vive en el **mismo servidor** que Laravel, lo más seguro es **no exponerlo a la red en absoluto**: socket Unix + sin puerto TCP. Genera primero una contraseña fuerte:
+
+```bash
+openssl rand -base64 48
+```
+
+Edita `/etc/valkey/valkey.conf` (muchas directivas ya existen comentadas; búscalas y ajústalas):
+
+```conf
+# --- RED: no exponer a ninguna interfaz ---
+bind 127.0.0.1 -::1
+protected-mode yes
+port 0                              # desactiva TCP por completo; solo socket Unix
+
+# --- SOCKET UNIX: así se conecta Laravel ---
+unixsocket /run/valkey/valkey.sock
+unixsocketperm 770
+
+# --- AUTENTICACIÓN ---
+requirepass "PEGA_AQUI_LA_PASSWORD_GENERADA"
+
+# --- MEMORIA Y POLÍTICA ---
+maxmemory 2gb                       # ajústalo a cuánto le destines
+maxmemory-policy allkeys-lru        # cuidado con el typo: es allkeys-lru (con 'a')
+
+# --- PERSISTENCIA (para no perder sesiones/colas al reiniciar) ---
+appendonly yes
+appendfsync everysec
+
+# --- COMANDOS PELIGROSOS ---
+rename-command FLUSHALL ""
+rename-command FLUSHDB ""
+rename-command KEYS ""                  # KEYS bloquea el servidor en prod; Laravel no lo usa
+rename-command CONFIG "CONFIG_a8f3k2"   # renómbralo a algo impredecible en vez de borrarlo
+```
+
+> **Un typo aborta el arranque.** Si Valkey no levanta, revisa `systemctl status valkey`: el mensaje `FATAL CONFIG FILE ERROR` indica el número de línea exacto del error. Un valor mal escrito (ej. `llkeys-lru` en vez de `allkeys-lru`) impide el arranque, y como consecuencia el socket nunca se crea — de ahí un `No such file or directory` al intentar conectar, que es síntoma, no la causa.
+
+### 21.3 Directorio del socket, permisos y SELinux
+
+El directorio del socket en `/run` es efímero; créalo de forma persistente con tmpfiles para que sobreviva reinicios:
+
+```bash
+echo 'd /run/valkey 0750 valkey valkey -' > /etc/tmpfiles.d/valkey.conf
+systemd-tmpfiles --create
+```
+
+Para que PHP-FPM (y Netdata, si lo usas) lean el socket, agrega esos usuarios al grupo `valkey` —misma lógica de pertenencia a grupos que con `apache`:
+
+```bash
+usermod -aG valkey apache
+usermod -aG valkey dante         # si tus pools FPM corren como dante
+usermod -aG valkey netdata       # si monitoreas con Netdata
+```
+
+SELinux: activa el booleano de conexión web y etiqueta el directorio del socket si hay denials:
+
+```bash
+setsebool -P httpd_can_network_connect 1
+semanage fcontext -a -t redis_var_run_t "/run/valkey(/.*)?" 2>/dev/null || true
+restorecon -Rv /run/valkey
+
+# Si Valkey falla por SELinux, revisa denials y genera política puntual:
+ausearch -m avc -ts recent | grep -iE "valkey|redis"
+```
+
+### 21.4 Hardening del servicio (systemd)
+
+Refuerza el aislamiento con un drop-in en vez de editar el unit original:
+
+```bash
+systemctl edit valkey
+```
+
+```ini
+[Service]
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+NoNewPrivileges=true
+ReadWritePaths=/var/lib/valkey /run/valkey /var/log/valkey
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+MemoryDenyWriteExecute=true
+```
+
+### 21.5 Arranque y verificación
+
+```bash
+systemctl enable --now valkey
+systemctl status valkey --no-pager
+
+# Conexión por socket con auth
+valkey-cli -s /run/valkey/valkey.sock
+#   AUTH "tu_password"
+#   PING            -> debe responder PONG
+#   exit
+
+# Confirma que NO hay puerto TCP escuchando (debe salir vacío)
+ss -tlnp | grep 6379
+```
+
+### 21.6 Integración con Laravel
+
+Confirma la extensión phpredis (compilada en C, más rápida que Predis; no necesitas `predis/predis` por Composer si usas esta):
+
+```bash
+php -m | grep -i redis
+# si falta:
+dnf install -y php-redis && systemctl reload php-fpm
+```
+
+En el `.env` de cada plataforma, apuntando al socket y **separando** lo evictable (caché, en una DB) de lo que no debe desaparecer (sesiones/colas, en otra). Con socket Unix, `REDIS_PORT` debe ser `0`:
+
+```env
+REDIS_CLIENT=phpredis
+REDIS_HOST=/run/valkey/valkey.sock
+REDIS_PORT=0
+REDIS_PASSWORD="tu_password"
+
+REDIS_DB=0          # sesiones y colas (no deben desalojarse)
+REDIS_CACHE_DB=1    # caché (evictable con allkeys-lru)
+
+CACHE_STORE=redis
+SESSION_DRIVER=redis
+QUEUE_CONNECTION=redis
+```
+
+> **El `prefix` importa con multi-plataforma.** Todas tus apps comparten el mismo Valkey. El default de Laravel deriva el prefijo de claves de `APP_NAME`, así que asegúrate de que cada plataforma tenga un `APP_NAME` distinto (o un `REDIS_PREFIX` explícito) o las claves de caché de una pisarán las de otra.
+
+Como tienes la config cacheada, **los cambios al `.env` no surten efecto hasta regenerar el caché**:
+
+```bash
+php artisan config:clear && php artisan config:cache
+
+php artisan tinker
+>>> Cache::store('redis')->put('test', 'ok', 60); Cache::store('redis')->get('test');   # -> "ok"
+```
+
+> **Las variables siguen llamándose `REDIS_*` y el driver `redis`**: es solo el nombre del cliente. Por debajo está hablando con Valkey sin saberlo ni importarle.
+
+**Inspección de claves.** Como desactivamos `KEYS`, usa `SCAN` (no bloquea el servidor). Desde la shell, `--scan` itera solo:
+
+```bash
+export REDISCLI_AUTH="tu_password"     # evita exponer la password en el historial
+valkey-cli -s /run/valkey/valkey.sock -n 1 --scan                       # todas las de caché (DB 1)
+valkey-cli -s /run/valkey/valkey.sock -n 1 --scan --pattern "miapp_*"   # filtra por prefijo de app
+valkey-cli -s /run/valkey/valkey.sock INFO keyspace                     # conteo por DB de un vistazo
+```
+
+> **Orden seguro:** instala y verifica Valkey por completo (hasta que `PING` responda `PONG`) **antes** de cambiar los `.env`. Así, si algo falla en la conexión, no dejas las apps sin caché ni sesión.
+
+---
+
+## 22. Protección de formularios públicos (Turnstile + rate limiting)
+
+Los formularios de registro públicos son blanco de registro masivo automatizado de cuentas falsas. En este servidor, los logs mostraron múltiples IPs (rangos de proveedores de hosting, no usuarios reales) haciendo `POST /registro` exitoso de forma sostenida. El rate limiting por sí solo **no basta** porque los bots rotan IPs: cada una se mantiene por debajo del umbral. La defensa efectiva es por capas.
+
+### 22.1 Cloudflare Turnstile (la pieza principal)
+
+Turnstile es un CAPTCHA gratuito y respetuoso de la privacidad. Lo crítico es que la validación ocurra **en el servidor**, no solo renderizar el widget: un bot que haga POST directo sin pasar por el navegador debe ser rechazado igualmente.
+
+Service de verificación (`app/Services/TurnstileService.php`):
+
+```php
+public function verify(string $token, string $ip): bool
+{
+    // Guarda barata: token vacío = ni siquiera llamamos a Cloudflare.
+    // Evita el round-trip (con su timeout) en el caso más común de abuso (POST sin token).
+    if ($token === '') {
+        return false;
+    }
+
+    try {
+        $response = Http::asForm()->timeout(5)->post(self::VERIFY_URL, [
+            'secret'   => config('services.turnstile.secret_key'),
+            'response' => $token,
+            'remoteip' => $ip,
+        ]);
+
+        return $response->successful() && $response->json('success') === true;
+    } catch (\Illuminate\Http\Client\ConnectionException) {
+        return false;   // fail-closed: si Cloudflare no responde, nadie se registra
+    }
+}
+```
+
+En el controlador, verifica **antes** de validar o tocar la base de datos:
+
+```php
+if (! $this->turnstile->verify((string) $request->input('cf-turnstile-response'), $request->ip())) {
+    return back()->withInput()->withErrors(['captcha' => 'No se pudo verificar que eres humano.']);
+}
+```
+
+Dos decisiones de diseño a tener conscientes: el `catch` devuelve `false` (**fail-closed**), correcto para frenar abuso pero implica que un fallo de red con Cloudflare bloquearía registros legítimos; y si tienes **varias rutas de registro** (ej. host y cliente), las **dos** deben llevar la verificación, o los bots usarán la desprotegida.
+
+### 22.2 Rate limiting específico (capa secundaria)
+
+No quites el rate limiter al poner Turnstile; son complementarios. Para la ruta de registro, algo más agresivo que el default:
+
+```php
+RateLimiter::for('registro', function (Request $request) {
+    return [
+        Limit::perMinute(3)->by($request->ip()),
+        Limit::perDay(10)->by($request->ip()),
+    ];
+});
+```
+
+### 22.3 Verificación de email obligatoria (contención)
+
+Aunque una cuenta logre registrarse, no debe poder hacer nada hasta verificar su email. Usa `MustVerifyEmail` en el modelo `User` y el middleware `verified` en las rutas protegidas. Esto convierte cualquier cuenta basura que se cuele en una cuenta inerte.
+
+### 22.4 Cómo verificar que funciona (el log engaña)
+
+El log de Apache **no distingue** un registro exitoso de un rechazo de Turnstile: ambos producen un `302` (el éxito redirige a `/verification.notice`; el rechazo regresa al formulario con `back()`). Por eso, ver cientos de `302` en `/registro` **no significa** que entren cuentas. El termómetro real es la base de datos:
+
+```sql
+SELECT COUNT(*) FROM users WHERE created_at >= CURDATE();
+```
+
+Si ese conteo se mantiene en tus números reales esperados (o en cero, si no esperabas altas legítimas) mientras el log sigue mostrando intentos, Turnstile está haciendo su trabajo. **Los bots no dejarán de intentar** —seguirás viendo los `302` y los `POST`— pero no crearán cuentas. No te alarmes por el ruido del log; vigila el `COUNT`.
+
+> **Defensa en profundidad real:** Turnstile mata el registro automatizado, el rate limiter atrapa a los más insistentes, el bloqueo del vhost (sección 16) frena el escaneo antes de PHP, y Fail2Ban (sección 17) banea reincidentes a nivel firewall. Cada capa cubre el hueco de las otras.
+
+---
+
+## 23. Optimización de rendimiento
+
+Una vez asegurado el servidor, estas son las palancas de rendimiento para Laravel/Filament. **Dimensiona con datos, no a ojo:** mide el consumo real bajo carga antes de fijar valores, y aplica un cambio a la vez validando que ayudó.
+
+> **Paso cero (crítico):** confirma que cada app esté en producción. `php artisan about` debe mostrar `Environment = production` y `Debug Mode = OFF`. Con `APP_DEBUG=true` en un server público, cualquier excepción expone credenciales y variables de entorno al visitante — es a la vez fuga de seguridad y costo de rendimiento.
+
+### 23.1 OPcache
+
+El default (`memory_consumption=128`, `max_accelerated_files=10000`) se queda corto para varias apps Laravel + Filament: un solo proyecto con su `vendor/` ronda los 8–12k archivos, así que con dos se desaloja OPcache constantemente. En `/etc/php.d/10-opcache.ini`:
+
+```ini
+opcache.enable=1
+opcache.memory_consumption=512        ; subir de 128
+opcache.interned_strings_buffer=32    ; subir de 8
+opcache.max_accelerated_files=65000   ; subir de 10000
+opcache.save_comments=1               ; NO apagar: Filament/Laravel usan atributos
+opcache.validate_timestamps=0         ; SOLO si el deploy resetea OPcache (ver abajo)
+opcache.revalidate_freq=0
+```
+
+Y habilita el JIT de PCRE (acelera el motor de regex de rutas/validación), que suele venir apagado:
+
+```ini
+; /etc/php.d/30-pcre.ini
+pcre.jit=1
+```
+
+> `validate_timestamps=0` solo cuando tu script de deploy (sección 19) termine con un reset de OPcache (`cachetool opcache:reset` o `systemctl reload php-fpm`); de lo contrario, los cambios de código no se reflejarían tras un deploy. El **JIT de PHP** (distinto del de PCRE) lo puedes dejar desactivado: para carga ligada a I/O como Laravel el beneficio es marginal.
+
+### 23.2 PHP-FPM: un pool por plataforma
+
+Un solo pool `www` compartido por todas las apps es frágil: un pico en una puede dejar sin workers a las demás, y todas corren como `apache` con el mismo log. Lo correcto es **un pool por plataforma**, cada uno con su usuario. En `/etc/php-fpm.d/miapp.conf`:
+
+```ini
+[miapp]
+user = dante
+group = apache
+listen = /run/php-fpm/miapp.sock
+listen.owner = apache
+listen.group = apache
+listen.mode = 0660
+
+pm = ondemand                          ; tráfico bajo/medio: libera RAM al estar ocioso
+pm.max_children = 20
+pm.process_idle_timeout = 30s
+pm.max_requests = 500                  ; recicla workers -> evita fugas de memoria
+
+php_admin_value[memory_limit] = 384M   ; por pool, NO el 1024M global
+slowlog = /var/log/php-fpm/miapp-slow.log
+request_slowlog_timeout = 5s
+pm.status_path = /status
+```
+
+> El `memory_limit` global alto (ej. 1024M) es peligroso para web: 50 children × 1 GB = 50 GB teóricos. Déjalo alto para CLI (migraciones, exports) pero acótalo por pool. Mide el peso real por proceso bajo carga para dimensionar `max_children`:
+> ```bash
+> ps --no-headers -o rss -C php-fpm | awk '{s+=$1;n++} END {printf "%.0f MB prom, %d procs\n", s/n/1024, n}'
+> ```
+
+### 23.3 MySQL 8.4
+
+> **Advertencia de método:** afinar a fondo un MySQL con poca data es prematuro. Lo de mayor valor al inicio es **encender el slow query log** para tener con qué trabajar cuando llegue tráfico real.
+
+En `/etc/my.cnf.d/optimization.cnf`:
+
+```ini
+[mysqld]
+# Diagnóstico (lo más importante al inicio)
+slow_query_log = ON
+long_query_time = 1
+log_queries_not_using_indexes = ON     ; ruidoso; apágalo tras la fase inicial
+
+# Redo log (en 8.4 reemplaza a innodb_log_file_size; el default de ~48M es chico)
+innodb_redo_log_capacity = 1G          ; requiere reinicio de MySQL
+
+# Acorde al hardware (SSD SATA, no NVMe). 10000 es irreal para esos discos.
+innodb_io_capacity = 2000
+innodb_io_capacity_max = 4000
+
+tmp_table_size = 64M
+max_heap_table_size = 64M
+```
+
+> **No bajes `innodb_flush_log_at_trx_commit` de 1** si manejas datos fiscales/contables (CFDI, SAT): no sacrifiques integridad transaccional por un microbenchmark. Sube `innodb_buffer_pool_size` (default puede quedar corto) solo conforme crezcan los datos; tienes RAM de sobra.
+
+### 23.4 Apache MPM event y HTTP/2
+
+Con PHP-FPM, el MPM debe ser **event** (no prefork). Define los límites explícitos y confirma HTTP/2 y compresión:
+
+```apache
+<IfModule mpm_event_module>
+    StartServers             3
+    ServerLimit              16
+    ThreadLimit              64
+    ThreadsPerChild          25
+    MaxRequestWorkers        400
+    MinSpareThreads          75
+    MaxSpareThreads          250
+    MaxConnectionsPerChild   10000
+</IfModule>
+
+Protocols h2 h2c http/1.1
+KeepAlive On
+MaxKeepAliveRequests 100
+KeepAliveTimeout 5
+```
+
+Y cachea agresivamente los assets compilados de Vite (nombres con hash → inmutables), dentro del VirtualHost:
+
+```apache
+<LocationMatch "^/build/.*\.(js|css|woff2?|svg|png|jpe?g|webp|avif)$">
+    Header set Cache-Control "public, max-age=31536000, immutable"
+</LocationMatch>
+```
+
+### 23.5 Orden de aplicación seguro
+
+1. `APP_ENV=production` + `APP_DEBUG=false` → `artisan optimize` + `filament:optimize`.
+2. Valkey para caché/sesión/cola (sección 21).
+3. OPcache (memoria, files, `pcre.jit`) → `reload php-fpm`.
+4. Pools FPM por plataforma, uno a la vez.
+5. MySQL: slow log primero (sin reinicio), luego redo log + io_capacity (con reinicio).
+6. `opcache.validate_timestamps=0` SOLO cuando el deploy ya resetee OPcache.
+7. Apache MPM/HTTP2/compresión → `reload httpd`.
+
+Mide antes/después con `ab`/`wrk` contra un endpoint representativo, el `pm.status_path` de FPM, y `SHOW ENGINE INNODB STATUS` tras horas de uso real.
+
+---
+
+## 24. Checklist final de verificación
 
 | Área | Estado deseado | Cómo verificar |
 |---|---|---|
@@ -822,13 +1209,18 @@ mysqldump --single-transaction --routines miapp | gzip > /backups/miapp-$(date +
 | Cabeceras | HSTS, CSP, X-Frame, X-Content-Type, Referrer | escáner web / `curl -I` |
 | Fugas de versión | Sin versión en `Server` ni `X-Powered-By` | `curl -I https://tu-dominio.com` |
 | Fail2Ban | Jails sshd + apache + laravel-scan activos | `fail2ban-client status` |
+| Valkey | Solo socket Unix, sin puerto 6379, con auth | `ss -tlnp \| grep 6379` (vacío), `valkey-cli -s ... PING` |
+| Caché/sesión Laravel | Driver `redis` apuntando al socket | `php artisan about`, `tinker` con `Cache::store('redis')` |
+| Turnstile | Verificación server-side en TODAS las rutas de registro | `COUNT(*) users WHERE created_at >= CURDATE()` estable |
+| OPcache | memory/files dimensionados para multi-app | `php -i \| grep opcache.max_accelerated_files` |
+| MySQL slow log | Activo para diagnóstico | `SHOW VARIABLES LIKE 'slow_query_log'` |
 | security.txt | Presente | visitar `/.well-known/security.txt` |
 | Renovación SSL | Timer activo | `systemctl list-timers \| grep certbot` |
 | Actualizaciones | dnf-automatic activo | `systemctl status dnf-automatic.timer` |
 
 ---
 
-## 22. Apéndice: DNSSEC, GeoIP y PGP
+## 25. Apéndice: DNSSEC, GeoIP y PGP
 
 **DNSSEC / error "lame delegation" (RRSIG).** Este error **no se arregla en el servidor**, sino en el panel de tu registrador de dominio. Suele significar que activaste DNSSEC pero los registros **DS** (Delegation Signer) no coinciden con las llaves de tus servidores de nombres. Acción: en el panel del dominio, verifica que DNSSEC esté correctamente configurado contra tu proveedor DNS; si no lo usarás estrictamente, desactívalo para eliminar el error.
 
